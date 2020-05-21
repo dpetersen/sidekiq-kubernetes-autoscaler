@@ -1,0 +1,21 @@
+[package]
+name = "sidekiq-kubernetes-autoscaler"
+version = "0.1.0"
+authors = ["Don Petersen <don@donpetersen.net>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0.4"
+env_logger = "0.7"
+structopt = "0.3"
+redis = "0.16"
+kube = "0.34"
+kube-derive = "0.34"
+k8s-openapi = { version = "0.8", default-features = false, features = ["v1_14"] }
+anyhow = "1.0"
+tokio = { version = "0.2.21", features = ["macros", "time", "signal", "sync"] }
+
+[dev-dependencies]
+nix = "0.17"
