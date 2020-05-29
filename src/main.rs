@@ -1,11 +1,13 @@
 #[macro_use]
 extern crate log;
 
+mod config;
+mod sidekiq;
+
 use k8s_openapi::api::apps::v1::Deployment;
 use kube::api::{Api, ListParams, Meta};
 use kube::runtime::Reflector;
-use redis::{Commands, RedisResult};
-use std::collections::HashMap;
+use sidekiq::Sidekiq;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -19,14 +21,38 @@ struct Opt {
 // TODO probably need to deal with redis-namespace!
 // TODO Gonna need metrics, and that means a web server. See:
 // https://github.com/clux/version-rs
+// TODO this needs to take currently active work into account, not just queue size! Don't want to
+// say "oh there is no work to do" when sidekiq is still actually busy!
+// TODO have to periodically run when the app has sidekiq-cron. Might have to store a key for when
+// you last ran and ensure you run at some interval. But then you have to ensure you don't
+// autoscale down until it's run for a minute or two. Also, you have to pick which deployment to
+// run! Should be a required config!
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let c = config::Config {
+        deployments: vec![config::Deployment {
+            name: "Test 1".to_string(),
+            queues: vec!["queue-1".to_string(), "queue-2".to_string()],
+            min_replicas: 0,
+            max_replicas: 10,
+        }],
+        autoscaling: config::Autoscaling {
+            max_jobs: vec![
+                ("queue-1".to_string(), 100 as usize),
+                ("queue-2".to_string(), 100 as usize),
+            ]
+            .into_iter()
+            .collect(),
+        },
+    };
+    c.replicas(std::collections::HashMap::new())?;
+
     let opt = Opt::from_args();
     let application = opt.application;
     env_logger::init();
 
-    let mut sidekiq = Sidekiq::new_for_redis_url("redis://127.0.0.1/")?;
+    let mut sidekiq = Sidekiq::new("redis://127.0.0.1/")?;
     let queue_lengths = sidekiq.get_queue_lengths()?;
     dbg!(queue_lengths);
 
@@ -42,102 +68,6 @@ async fn main() -> anyhow::Result<()> {
 
     reflector.run().await?;
     Ok(())
-}
-
-struct Sidekiq {
-    connection: redis::Connection,
-}
-
-impl Sidekiq {
-    fn new_for_redis_url(c: impl redis::IntoConnectionInfo) -> RedisResult<Sidekiq> {
-        Ok(Sidekiq {
-            connection: redis::Client::open(c)?.get_connection()?,
-        })
-    }
-
-    fn get_queue_lengths(&mut self) -> RedisResult<HashMap<String, usize>> {
-        let queues: Vec<String> = self.connection.smembers("sidekiq:queues")?;
-        let lengths: Vec<usize> = queues
-            .iter()
-            .map(|s| format!("sidekiq:queue:{}", s))
-            .map(|s| self.connection.llen(s))
-            .collect::<RedisResult<Vec<usize>>>()?;
-        let h = queues.into_iter().zip(lengths.into_iter()).collect();
-        Ok(h)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nix::{sys::signal, unistd::Pid};
-    use redis::Commands;
-    use signal::Signal::SIGTERM;
-    use std::{panic::UnwindSafe, process::Command};
-
-    fn with_redis_running<T>(port: usize, test: T) -> anyhow::Result<()>
-    where
-        T: FnOnce() -> anyhow::Result<()> + UnwindSafe,
-    {
-        let mut handle = Command::new("redis-server")
-            .args(&[
-                "--save",
-                r#""#,
-                "--appendonly",
-                "no",
-                "--port",
-                &port.to_string(),
-            ])
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-
-        let result = std::panic::catch_unwind(|| test());
-
-        signal::kill(Pid::from_raw(handle.id() as i32), SIGTERM).unwrap();
-        assert!(handle.wait().unwrap().success());
-
-        assert!(result.is_ok());
-        Ok(())
-    }
-
-    fn poll_for_connection(url: String) -> RedisResult<redis::Connection> {
-        let client = redis::Client::open(url)?;
-
-        let mut i = 0;
-        loop {
-            match client.get_connection() {
-                Ok(c) => return Ok(c),
-                Err(_) if i < 5 => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    i += 1;
-                }
-                Err(e) => panic!("I give up trying to connect to the test redis: {}", e),
-            }
-        }
-    }
-
-    #[test]
-    fn queue_lengths() -> anyhow::Result<()> {
-        let port = 31981;
-        let url = format!("redis://localhost:{}/", port);
-
-        with_redis_running(port, || {
-            let mut conn = poll_for_connection(url.clone())?;
-            conn.sadd("sidekiq:queues", "one-queue")?;
-            conn.sadd("sidekiq:queues", "another-queue")?;
-            conn.lpush("sidekiq:queue:another-queue", "one-job")?;
-            conn.lpush("sidekiq:queue:another-queue", "another-job")?;
-
-            let mut sidekiq = Sidekiq::new_for_redis_url(url)?;
-            let map = sidekiq.get_queue_lengths()?;
-            assert_eq!(map.keys().len(), 2);
-            assert_eq!(map.get("one-queue"), Some(&0));
-            assert_eq!(map.get("another-queue"), Some(&2));
-
-            Ok(())
-        })
-    }
 }
 
 async fn keep_reflecting(reflector: Reflector<Deployment>) {
