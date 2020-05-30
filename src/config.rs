@@ -1,4 +1,3 @@
-use anyhow::anyhow;
 use conv::*;
 use std::collections::HashMap;
 
@@ -21,14 +20,15 @@ pub struct Deployment {
 impl Deployment {
     fn replicas_for_percentage(&self, percentage: f64) -> anyhow::Result<usize> {
         let mix_max_replica_difference = self.max_replicas - self.min_replicas;
-        let scale_up_amount = f64::value_from(mix_max_replica_difference)? * percentage;
-        let replicas = self.min_replicas + scale_up_amount.ceil() as usize;
-        if replicas < self.min_replicas {
-            return Ok(self.min_replicas);
-        } else if replicas > self.max_replicas {
-            return Ok(self.max_replicas);
-        }
-        Ok(replicas)
+        let scale_up_from_min = f64::value_from(mix_max_replica_difference)? * percentage;
+        let desired = self.min_replicas + scale_up_from_min.round() as usize;
+        Ok(match desired {
+            d if d < self.min_replicas => self.min_replicas,
+            d if d > self.max_replicas => self.max_replicas,
+            // if it rounded down to 0 but there is work to do
+            d if d == 0 && percentage > 0.0 => 1,
+            _ => desired,
+        })
     }
 }
 
@@ -42,36 +42,38 @@ impl Config {
         &self,
         queue_lengths: HashMap<String, usize>,
     ) -> anyhow::Result<HashMap<String, usize>> {
-        let mut res = HashMap::new();
+        let mut results = HashMap::new();
         for (queue, jobs) in queue_lengths {
             let deployments: Vec<_> = self
                 .deployments
                 .iter()
                 .filter(|d| d.queues.contains(&queue))
                 .collect();
-            dbg!(&deployments);
 
-            // you're failing here because I added an unexpected queue. It shouldn't actually fail
-            // on this, so what should it do? Default to running max on any job and min on 0 jobs?
-            let max_jobs = *self.autoscaling.max_jobs.get(&queue).ok_or(anyhow!(
-                "no autoscaling configuration for queue '{}'",
-                queue
-            ))?;
-
-            for d in deployments {
-                let replicas =
-                    d.replicas_for_percentage(f64::value_from(jobs)? / f64::value_from(max_jobs)?)?;
-
-                res.entry(d.name.clone())
-                    .and_modify(|i| {
-                        if replicas > *i {
-                            *i = replicas
-                        }
-                    })
-                    .or_insert(replicas);
+            for deployment in deployments {
+                let mut update_results = |replicas: usize| {
+                    results
+                        .entry(deployment.name.clone())
+                        .and_modify(|u| {
+                            if replicas > *u {
+                                *u = replicas
+                            }
+                        })
+                        .or_insert(replicas);
+                };
+                match self.autoscaling.max_jobs.get(&queue) {
+                    Some(u) => {
+                        let u = deployment.replicas_for_percentage(
+                            f64::value_from(jobs)? / f64::value_from(*u)?,
+                        )?;
+                        update_results(u);
+                    }
+                    None if deployment.min_replicas == 0 => update_results(1),
+                    None => update_results(deployment.min_replicas),
+                };
             }
         }
-        Ok(res)
+        Ok(results)
     }
 }
 
@@ -98,6 +100,23 @@ mod tests {
             };
             assert_eq!(d.replicas_for_percentage(percentage).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn replicas_for_percentage_unknown_queue() {
+        let mut d = Deployment {
+            name: "Test 1".to_string(),
+            queues: vec!["unknown-queue".to_string()],
+            min_replicas: 1,
+            max_replicas: 10,
+        };
+        assert_eq!(d.replicas_for_percentage(0.0).unwrap(), 1);
+        assert_eq!(d.replicas_for_percentage(0.0000001).unwrap(), 1);
+        assert_eq!(d.replicas_for_percentage(1.0).unwrap(), 10);
+
+        d.min_replicas = 0;
+        assert_eq!(d.replicas_for_percentage(0.0).unwrap(), 0);
+        assert_eq!(d.replicas_for_percentage(0.0000001).unwrap(), 1);
     }
 
     #[test]
