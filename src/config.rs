@@ -4,7 +4,6 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct Config {
     pub deployments: Vec<Deployment>,
-
     pub autoscaling: Autoscaling,
 }
 

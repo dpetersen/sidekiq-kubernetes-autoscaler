@@ -4,9 +4,10 @@ extern crate log;
 mod config;
 mod sidekiq;
 
+use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::Deployment;
 use kube::api::{Api, ListParams, Meta};
-use kube::runtime::Reflector;
+use kube_runtime::{reflector, reflector::store::Store, utils::try_flatten_applied, watcher};
 use sidekiq::Sidekiq;
 use structopt::StructOpt;
 
@@ -23,13 +24,14 @@ struct Opt {
 // https://github.com/clux/version-rs
 // TODO this needs to take currently active work into account, not just queue size! Don't want to
 // say "oh there is no work to do" when sidekiq is still actually busy!
-// TODO have to periodically run when the app has sidekiq-cron. Might have to store a key for when
-// you last ran and ensure you run at some interval. But then you have to ensure you don't
-// autoscale down until it's run for a minute or two. Also, you have to pick which deployment to
-// run! Should be a required config!
+// TODO I originally considered having this thing run periodically to account for sidekiq-cron, but
+// that's just crazy talk. If an app needs sidekiq-cron, it needs to run at least one worker
+// permanently.
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // TODO load from file. Don't bother with auto-reloading, you can do that with Kubernetes and
+    // ConfigMaps.
     let c = config::Config {
         deployments: vec![config::Deployment {
             name: "Test 1".to_string(),
@@ -61,32 +63,38 @@ async fn main() -> anyhow::Result<()> {
     let list: Api<Deployment> = Api::namespaced(client, &namespace);
     let params = ListParams::default()
         .timeout(10)
-        .labels(&format!("app={}", application));
-    let reflector = Reflector::new(list).params(params);
+        .labels(&format!("app.kubernetes.io/instance={}", application));
+    let store = reflector::store::Writer::<Deployment>::default();
+    let readable = store.as_reader();
+    let deployments = reflector(store, watcher(list, params));
 
-    tokio::spawn(keep_reflecting(reflector.clone()));
+    tokio::spawn(periodically_show_state(readable));
 
-    reflector.run().await?;
+    let mut rfa = try_flatten_applied(deployments).boxed();
+    while let Some(deployment) = rfa.try_next().await? {
+        dbg!(deployment.name());
+    }
+
     Ok(())
 }
 
-async fn keep_reflecting(reflector: Reflector<Deployment>) {
+async fn periodically_show_state(store: Store<Deployment>) {
     loop {
-        tokio::time::delay_for(std::time::Duration::from_secs(3)).await;
-        let deployments: Vec<_> = reflector
+        let deployments: Vec<_> = store
             .state()
-            .await
-            .unwrap() // it returns a Result but can't error
             .iter()
             .filter(|o| {
                 o.meta()
-                    .name
+                    .labels
                     .as_ref()
+                    .unwrap_or(&std::collections::BTreeMap::new())
+                    .get("app.kubernetes.io/component")
                     .unwrap_or(&"".to_string())
-                    .contains("-sidekiq-")
+                    .starts_with("background-worker")
             })
             .map(Meta::name)
             .collect();
-        info!("current deploys: {:?}", deployments);
+        dbg!(deployments);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 }
