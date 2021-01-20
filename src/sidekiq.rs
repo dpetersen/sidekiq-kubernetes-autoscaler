@@ -1,26 +1,41 @@
-use redis::{Commands, RedisResult};
+use anyhow::anyhow;
+use bb8_redis::{bb8, redis::AsyncCommands, RedisConnectionManager};
+use futures_util::future::try_join_all;
 use std::collections::HashMap;
 
 pub struct Sidekiq {
-    connection: redis::Connection,
+    pool: bb8::Pool<RedisConnectionManager>,
 }
 
 impl Sidekiq {
-    pub fn new(c: impl redis::IntoConnectionInfo) -> RedisResult<Sidekiq> {
-        Ok(Sidekiq {
-            connection: redis::Client::open(c)?.get_connection()?,
-        })
+    pub async fn new(c: impl bb8_redis::redis::IntoConnectionInfo) -> anyhow::Result<Sidekiq> {
+        let manager = RedisConnectionManager::new(c)?;
+        let pool = bb8::Pool::builder().build(manager).await?;
+        Ok(Sidekiq { pool })
     }
 
-    pub fn get_queue_lengths(&mut self) -> RedisResult<HashMap<String, usize>> {
-        let queues: Vec<String> = self.connection.smembers("sidekiq:queues")?;
-        let lengths: Vec<usize> = queues
-            .iter()
-            .map(|s| format!("sidekiq:queue:{}", s))
-            .map(|s| self.connection.llen(s))
-            .collect::<RedisResult<Vec<usize>>>()?;
-        let h = queues.into_iter().zip(lengths.into_iter()).collect();
-        Ok(h)
+    pub async fn get_queue_lengths(&mut self) -> anyhow::Result<HashMap<String, usize>> {
+        let queues: Vec<String> = self.pool.get().await?.smembers("sidekiq:queues").await?;
+
+        let mut handles = Vec::new();
+        for queue in queues.clone() {
+            let pool = self.pool.clone();
+            handles.push(tokio::spawn(async move {
+                match pool.get().await {
+                    Ok(mut conn) => match conn.llen(format!("sidekiq:queue:{}", queue)).await {
+                        Ok(len) => Ok(len),
+                        Err(e) => Err(anyhow!(e)),
+                    },
+                    Err(e) => Err(anyhow!(e)),
+                }
+            }));
+        }
+
+        let lengths: Vec<usize> = try_join_all(handles)
+            .await?
+            .into_iter()
+            .collect::<Result<_, _>>()?;
+        Ok(queues.into_iter().zip(lengths.into_iter()).collect())
     }
 }
 
@@ -28,7 +43,7 @@ impl Sidekiq {
 mod tests {
     use super::*;
     use nix::{sys::signal, unistd::Pid};
-    use redis::Commands;
+    use redis::{Commands, RedisResult};
     use signal::Signal::SIGTERM;
     use std::{panic::UnwindSafe, process::Command};
 
@@ -86,8 +101,8 @@ mod tests {
             conn.lpush("sidekiq:queue:another-queue", "one-job")?;
             conn.lpush("sidekiq:queue:another-queue", "another-job")?;
 
-            let mut sidekiq = Sidekiq::new(url)?;
-            let map = sidekiq.get_queue_lengths()?;
+            let mut sidekiq = tokio_test::block_on(Sidekiq::new(url))?;
+            let map = tokio_test::block_on(sidekiq.get_queue_lengths())?;
             assert_eq!(map.keys().len(), 2);
             assert_eq!(map.get("one-queue"), Some(&0));
             assert_eq!(map.get("another-queue"), Some(&2));

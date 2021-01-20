@@ -32,6 +32,7 @@ struct Opt {
 async fn main() -> anyhow::Result<()> {
     // TODO load from file. Don't bother with auto-reloading, you can do that with Kubernetes and
     // ConfigMaps.
+    // TODO don't ? out of transient errors
     let c = config::Config {
         deployments: vec![config::Deployment {
             name: "Test 1".to_string(),
@@ -54,9 +55,8 @@ async fn main() -> anyhow::Result<()> {
     let application = opt.application;
     env_logger::init();
 
-    let mut sidekiq = Sidekiq::new("redis://127.0.0.1/")?;
-    let queue_lengths = sidekiq.get_queue_lengths()?;
-    dbg!(queue_lengths);
+    let sidekiq = Sidekiq::new("redis://127.0.0.1/").await?;
+    tokio::spawn(periodically_show_sidekiq_state(sidekiq));
 
     let client = kube::Client::try_default().await?;
     let namespace = "default".to_string();
@@ -66,19 +66,31 @@ async fn main() -> anyhow::Result<()> {
         .labels(&format!("app.kubernetes.io/instance={}", application));
     let store = reflector::store::Writer::<Deployment>::default();
     let readable = store.as_reader();
-    let deployments = reflector(store, watcher(list, params));
+    let reflector = reflector(store, watcher(list, params));
 
-    tokio::spawn(periodically_show_state(readable));
+    tokio::spawn(periodically_show_deployment_state(readable));
 
-    let mut rfa = try_flatten_applied(deployments).boxed();
-    while let Some(deployment) = rfa.try_next().await? {
+    let mut flattened_reflector = try_flatten_applied(reflector).boxed();
+    while let Some(deployment) = flattened_reflector.try_next().await? {
         dbg!(deployment.name());
     }
 
     Ok(())
 }
 
-async fn periodically_show_state(store: Store<Deployment>) {
+async fn periodically_show_sidekiq_state(mut sidekiq: Sidekiq) {
+    loop {
+        match sidekiq.get_queue_lengths().await {
+            Ok(queues) => {
+                dbg!(queues);
+            }
+            Err(e) => error!("getting sidekiq queue lengths: {}", e),
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
+
+async fn periodically_show_deployment_state(store: Store<Deployment>) {
     loop {
         let deployments: Vec<_> = store
             .state()
