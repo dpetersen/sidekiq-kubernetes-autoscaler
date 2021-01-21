@@ -1,6 +1,4 @@
-use anyhow::anyhow;
-use bb8_redis::{bb8, redis::AsyncCommands, RedisConnectionManager};
-use futures_util::future::try_join_all;
+use bb8_redis::{bb8, redis, redis::AsyncCommands, RedisConnectionManager};
 use std::collections::HashMap;
 
 pub struct Sidekiq {
@@ -15,26 +13,15 @@ impl Sidekiq {
     }
 
     pub async fn get_queue_lengths(&mut self) -> anyhow::Result<HashMap<String, usize>> {
-        let queues: Vec<String> = self.pool.get().await?.smembers("sidekiq:queues").await?;
+        let mut conn = self.pool.get().await?;
+        let queues: Vec<String> = conn.smembers("sidekiq:queues").await?;
 
-        let mut handles = Vec::new();
-        for queue in queues.clone() {
-            let pool = self.pool.clone();
-            handles.push(tokio::spawn(async move {
-                match pool.get().await {
-                    Ok(mut conn) => match conn.llen(format!("sidekiq:queue:{}", queue)).await {
-                        Ok(len) => Ok(len),
-                        Err(e) => Err(anyhow!(e)),
-                    },
-                    Err(e) => Err(anyhow!(e)),
-                }
-            }));
+        let mut pipeline = redis::Pipeline::new();
+        for queue in &queues {
+            pipeline.cmd("LLEN").arg(format!("sidekiq:queue:{}", queue));
         }
+        let lengths: Vec<usize> = pipeline.query_async(&mut *conn).await?;
 
-        let lengths: Vec<usize> = try_join_all(handles)
-            .await?
-            .into_iter()
-            .collect::<Result<_, _>>()?;
         Ok(queues.into_iter().zip(lengths.into_iter()).collect())
     }
 }
