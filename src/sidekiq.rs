@@ -1,18 +1,19 @@
-use bb8_redis::{bb8, redis, redis::AsyncCommands, RedisConnectionManager};
+use anyhow::Result;
+use bb8_redis::{bb8::Pool, redis, redis::AsyncCommands, RedisConnectionManager};
 use std::collections::HashMap;
 
 pub struct Sidekiq {
-    pool: bb8::Pool<RedisConnectionManager>,
+    pool: Pool<RedisConnectionManager>,
 }
 
 impl Sidekiq {
-    pub async fn new(c: impl bb8_redis::redis::IntoConnectionInfo) -> anyhow::Result<Sidekiq> {
+    pub async fn new(c: impl redis::IntoConnectionInfo) -> Result<Sidekiq> {
         let manager = RedisConnectionManager::new(c)?;
-        let pool = bb8::Pool::builder().build(manager).await?;
+        let pool = Pool::builder().build(manager).await?;
         Ok(Sidekiq { pool })
     }
 
-    pub async fn get_queue_lengths(&mut self) -> anyhow::Result<HashMap<String, usize>> {
+    pub async fn get_queue_lengths(&mut self) -> Result<HashMap<String, usize>> {
         let mut conn = self.pool.get().await?;
         let queues: Vec<String> = conn.smembers("sidekiq:queues").await?;
 
@@ -34,9 +35,9 @@ mod tests {
     use signal::Signal::SIGTERM;
     use std::{panic::UnwindSafe, process::Command};
 
-    fn with_redis_running<T>(port: usize, test: T) -> anyhow::Result<()>
+    fn with_redis_running<T>(port: usize, test: T) -> Result<()>
     where
-        T: FnOnce() -> anyhow::Result<()> + UnwindSafe,
+        T: FnOnce() -> Result<()> + UnwindSafe,
     {
         let mut handle = Command::new("redis-server")
             .args(&[
@@ -77,7 +78,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_lengths() -> anyhow::Result<()> {
+    fn queue_lengths() -> Result<()> {
         let port = 31981;
         let url = format!("redis://localhost:{}/", port);
 

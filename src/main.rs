@@ -33,7 +33,6 @@ struct Opt {
 async fn main() -> anyhow::Result<()> {
     // TODO load from file. Don't bother with auto-reloading, you can do that with Kubernetes and
     // ConfigMaps.
-    // TODO don't ? out of transient errors
     let c = config::Config {
         deployments: vec![config::Deployment {
             name: "Test 1".to_string(),
@@ -71,6 +70,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
     debug!("cancel requested");
     cancel.cancel();
+    // TODO if this is an error (which it would be if it couldn't connect to k8s), you won't find
+    // out until the program is shutting down. That seems like an issue.
     state_fetch_result.await??;
 
     info!("gracefully shut down");
