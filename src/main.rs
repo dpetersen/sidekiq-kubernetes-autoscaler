@@ -1,15 +1,15 @@
 #[macro_use]
 extern crate log;
 
+mod cluster_state;
 mod config;
+mod scaler;
 mod sidekiq;
 
-use futures::{StreamExt, TryStreamExt};
-use k8s_openapi::api::apps::v1::Deployment;
-use kube::api::{Api, ListParams, Meta};
-use kube_runtime::{reflector, reflector::store::Store, utils::try_flatten_applied, watcher};
+use scaler::ClusterStateFetcher;
 use sidekiq::Sidekiq;
 use structopt::StructOpt;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "sidekiq-kubernetes-autoscaler")]
@@ -23,7 +23,8 @@ struct Opt {
 // TODO Gonna need metrics, and that means a web server. See:
 // https://github.com/clux/version-rs
 // TODO this needs to take currently active work into account, not just queue size! Don't want to
-// say "oh there is no work to do" when sidekiq is still actually busy!
+// say "oh there is no work to do" when sidekiq is still actually busy! But "quiet" workers need to
+// also be handled, since they are already shutting down. I *think* that means you can ignore them.
 // TODO I originally considered having this thing run periodically to account for sidekiq-cron, but
 // that's just crazy talk. If an app needs sidekiq-cron, it needs to run at least one worker
 // permanently.
@@ -58,23 +59,21 @@ async fn main() -> anyhow::Result<()> {
     let sidekiq = Sidekiq::new("redis://127.0.0.1/").await?;
     tokio::spawn(periodically_show_sidekiq_state(sidekiq));
 
-    let client = kube::Client::try_default().await?;
-    let namespace = "default".to_string();
-    let list: Api<Deployment> = Api::namespaced(client, &namespace);
-    let params = ListParams::default()
-        .timeout(10)
-        .labels(&format!("app.kubernetes.io/instance={}", application));
-    let store = reflector::store::Writer::<Deployment>::default();
-    let readable = store.as_reader();
-    let reflector = reflector(store, watcher(list, params));
+    let (cluster_state_fetcher, store) =
+        cluster_state::AppClusterStateFetcher::new_for(application, "default".to_string());
+    let cluster_store_reader =
+        cluster_state::AppClusterStoreReader::new_with_store(store.as_reader());
+    let cancel = CancellationToken::new();
+    let state_fetch_result = tokio::spawn(cluster_state_fetcher.start(store, cancel.clone()));
 
-    tokio::spawn(periodically_show_deployment_state(readable));
+    cluster_store_reader.get_current_state()?;
 
-    let mut flattened_reflector = try_flatten_applied(reflector).boxed();
-    while let Some(deployment) = flattened_reflector.try_next().await? {
-        dbg!(deployment.name());
-    }
+    tokio::signal::ctrl_c().await?;
+    debug!("cancel requested");
+    cancel.cancel();
+    state_fetch_result.await??;
 
+    info!("gracefully shut down");
     Ok(())
 }
 
@@ -86,27 +85,6 @@ async fn periodically_show_sidekiq_state(mut sidekiq: Sidekiq) {
             }
             Err(e) => error!("getting sidekiq queue lengths: {}", e),
         };
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-}
-
-async fn periodically_show_deployment_state(store: Store<Deployment>) {
-    loop {
-        let deployments: Vec<_> = store
-            .state()
-            .iter()
-            .filter(|o| {
-                o.meta()
-                    .labels
-                    .as_ref()
-                    .unwrap_or(&std::collections::BTreeMap::new())
-                    .get("app.kubernetes.io/component")
-                    .unwrap_or(&"".to_string())
-                    .starts_with("background-worker")
-            })
-            .map(Meta::name)
-            .collect();
-        dbg!(deployments);
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 }
