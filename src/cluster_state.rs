@@ -15,25 +15,27 @@ use tokio_util::sync::CancellationToken;
 pub struct AppClusterStateFetcher {
     app: String,
     namespace: String,
+    writer: Writer<Deployment>,
 }
 
 impl AppClusterStateFetcher {
-    pub fn new_for(app: String, namespace: String) -> (AppClusterStateFetcher, Writer<Deployment>) {
-        let fetcher = AppClusterStateFetcher { app, namespace };
+    pub fn new_for(app: String, namespace: String) -> (AppClusterStateFetcher, Store<Deployment>) {
         let writer = reflector::store::Writer::<Deployment>::default();
-        (fetcher, writer)
+        let reader = writer.as_reader();
+        let fetcher = AppClusterStateFetcher {
+            app,
+            namespace,
+            writer,
+        };
+        (fetcher, reader)
     }
 
-    pub async fn start(
-        self,
-        store: Writer<Deployment>,
-        cancel: CancellationToken,
-    ) -> anyhow::Result<()> {
+    pub async fn start(self, cancel: CancellationToken) -> anyhow::Result<()> {
         let client = kube::Client::try_default().await?;
         let list: Api<Deployment> = Api::namespaced(client, &self.namespace);
         let params =
             ListParams::default().labels(&format!("app.kubernetes.io/instance={}", self.app));
-        let reflector = reflector(store, watcher(list, params));
+        let reflector = reflector(self.writer, watcher(list, params));
         let mut flattened_reflector = try_flatten_applied(reflector).boxed();
 
         debug!("deployment reflection started");

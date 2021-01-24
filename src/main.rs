@@ -60,10 +60,9 @@ async fn main() -> anyhow::Result<()> {
 
     let (cluster_state_fetcher, store) =
         cluster_state::AppClusterStateFetcher::new_for(application, "default".to_string());
-    let cluster_store_reader =
-        cluster_state::AppClusterStoreReader::new_with_store(store.as_reader());
+    let cluster_store_reader = cluster_state::AppClusterStoreReader::new_with_store(store);
     let cancel = CancellationToken::new();
-    let state_fetch_result = tokio::spawn(cluster_state_fetcher.start(store, cancel.clone()));
+    let state_fetch_result = tokio::spawn(cluster_state_fetcher.start(cancel.clone()));
 
     cluster_store_reader.get_current_state()?;
 
