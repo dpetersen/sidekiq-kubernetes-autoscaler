@@ -50,6 +50,7 @@ impl AppClusterStateFetcher {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
+                    debug!("Kuberetes reflection cancelled");
                     return Ok(());
                 },
                 next = flattened_reflector.try_next() => {

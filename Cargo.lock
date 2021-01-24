@@ -1458,6 +1458,7 @@ name = "sidekiq-kubernetes-autoscaler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bb8-redis",
  "conv",
  "env_logger 0.8.2",

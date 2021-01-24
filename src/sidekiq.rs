@@ -1,6 +1,7 @@
+use crate::scaler::{SidekiqState, SidekiqStateFetcher};
 use anyhow::Result;
+use async_trait::async_trait;
 use bb8_redis::{bb8::Pool, redis, redis::AsyncCommands, RedisConnectionManager};
-use std::collections::HashMap;
 
 pub struct Sidekiq {
     pool: Pool<RedisConnectionManager>,
@@ -12,8 +13,11 @@ impl Sidekiq {
         let pool = Pool::builder().build(manager).await?;
         Ok(Sidekiq { pool })
     }
+}
 
-    pub async fn get_queue_lengths(&mut self) -> Result<HashMap<String, usize>> {
+#[async_trait]
+impl SidekiqStateFetcher for Sidekiq {
+    async fn get_current_state(&mut self) -> Result<SidekiqState> {
         let mut conn = self.pool.get().await?;
         let queues: Vec<String> = conn.smembers("sidekiq:queues").await?;
 
@@ -22,8 +26,9 @@ impl Sidekiq {
             pipeline.cmd("LLEN").arg(format!("sidekiq:queue:{}", queue));
         }
         let lengths: Vec<usize> = pipeline.query_async(&mut *conn).await?;
+        let queue_lengths = queues.into_iter().zip(lengths.into_iter()).collect();
 
-        Ok(queues.into_iter().zip(lengths.into_iter()).collect())
+        Ok(SidekiqState { queue_lengths })
     }
 }
 
@@ -90,10 +95,10 @@ mod tests {
             conn.lpush("sidekiq:queue:another-queue", "another-job")?;
 
             let mut sidekiq = tokio_test::block_on(Sidekiq::new(url))?;
-            let map = tokio_test::block_on(sidekiq.get_queue_lengths())?;
-            assert_eq!(map.keys().len(), 2);
-            assert_eq!(map.get("one-queue"), Some(&0));
-            assert_eq!(map.get("another-queue"), Some(&2));
+            let map = tokio_test::block_on(sidekiq.get_current_state())?;
+            assert_eq!(map.queue_lengths.keys().len(), 2);
+            assert_eq!(map.queue_lengths.get("one-queue"), Some(&0));
+            assert_eq!(map.queue_lengths.get("another-queue"), Some(&2));
 
             Ok(())
         })

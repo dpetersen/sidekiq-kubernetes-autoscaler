@@ -6,7 +6,8 @@ mod config;
 mod scaler;
 mod sidekiq;
 
-use scaler::ClusterStateFetcher;
+use cluster_state::{AppClusterStateFetcher, AppClusterStoreReader};
+use scaler::Scaler;
 use sidekiq::Sidekiq;
 use structopt::StructOpt;
 use tokio_util::sync::CancellationToken;
@@ -55,36 +56,30 @@ async fn main() -> anyhow::Result<()> {
     let application = opt.application;
     env_logger::init();
 
-    let sidekiq = Sidekiq::new("redis://127.0.0.1/").await?;
-    tokio::spawn(periodically_show_sidekiq_state(sidekiq));
+    let sidekiq_fetcher = Sidekiq::new("redis://127.0.0.1/").await?;
 
-    let (cluster_state_fetcher, store) =
-        cluster_state::AppClusterStateFetcher::new_for(application, "default".to_string()).await?;
-    let cluster_store_reader = cluster_state::AppClusterStoreReader::new_with_store(store);
+    let (cluster_fetcher, store) =
+        AppClusterStateFetcher::new_for(application, "default".to_string()).await?;
+    let cluster_store_reader = AppClusterStoreReader::new_with_store(store);
     let cancel = CancellationToken::new();
-    let state_fetch_result = tokio::spawn(cluster_state_fetcher.start(cancel.clone()));
+    let state_fetch_handle = tokio::spawn(cluster_fetcher.start(cancel.clone()));
+    let scaler = Scaler::new(cluster_store_reader, sidekiq_fetcher);
 
-    cluster_store_reader.get_current_state()?;
+    let run_handle = tokio::spawn(scaler.run(cancel.clone()));
 
     tokio::signal::ctrl_c().await?;
     debug!("cancel requested");
     cancel.cancel();
     // TODO if there is an error during reflection, I'm not going to know about it until now. That
     // doesn't seem ideal.
-    state_fetch_result.await??;
+    let (state_fetch_res, run_res) = tokio::join!(state_fetch_handle, run_handle);
+    if let Err(e) = state_fetch_res {
+        error!("in cluster state fetching: {}", e);
+    }
+    if let Err(e) = run_res {
+        error!("in Scaler run: {}", e);
+    }
 
     info!("gracefully shut down");
     Ok(())
-}
-
-async fn periodically_show_sidekiq_state(mut sidekiq: Sidekiq) {
-    loop {
-        match sidekiq.get_queue_lengths().await {
-            Ok(queues) => {
-                dbg!(queues);
-            }
-            Err(e) => error!("getting sidekiq queue lengths: {}", e),
-        };
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
 }
