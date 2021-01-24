@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(periodically_show_sidekiq_state(sidekiq));
 
     let (cluster_state_fetcher, store) =
-        cluster_state::AppClusterStateFetcher::new_for(application, "default".to_string());
+        cluster_state::AppClusterStateFetcher::new_for(application, "default".to_string()).await?;
     let cluster_store_reader = cluster_state::AppClusterStoreReader::new_with_store(store);
     let cancel = CancellationToken::new();
     let state_fetch_result = tokio::spawn(cluster_state_fetcher.start(cancel.clone()));
@@ -69,8 +69,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
     debug!("cancel requested");
     cancel.cancel();
-    // TODO if this is an error (which it would be if it couldn't connect to k8s), you won't find
-    // out until the program is shutting down. That seems like an issue.
+    // TODO if there is an error during reflection, I'm not going to know about it until now. That
+    // doesn't seem ideal.
     state_fetch_result.await??;
 
     info!("gracefully shut down");
