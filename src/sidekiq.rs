@@ -2,6 +2,7 @@ use crate::scaler::{SidekiqState, SidekiqStateFetcher};
 use anyhow::Result;
 use async_trait::async_trait;
 use bb8_redis::{bb8::Pool, redis, redis::AsyncCommands, RedisConnectionManager};
+use std::time::Duration;
 
 pub struct Sidekiq {
     pool: Pool<RedisConnectionManager>,
@@ -10,7 +11,10 @@ pub struct Sidekiq {
 impl Sidekiq {
     pub async fn new(c: impl redis::IntoConnectionInfo) -> Result<Sidekiq> {
         let manager = RedisConnectionManager::new(c)?;
-        let pool = Pool::builder().build(manager).await?;
+        let pool = Pool::builder()
+            .connection_timeout(Duration::from_secs(3))
+            .build(manager)
+            .await?;
         Ok(Sidekiq { pool })
     }
 }

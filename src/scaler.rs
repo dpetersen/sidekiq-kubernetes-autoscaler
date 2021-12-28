@@ -42,6 +42,13 @@ impl<C: ClusterStateFetcher, S: SidekiqStateFetcher> Scaler<C, S> {
             // know if it's been written to yet...
             // TODO getting state probably shouldn't crash this function?
             let cluster_state = self.cluster_fetcher.get_current_state()?;
+            if cluster_state.replicas.is_empty() {
+                warn!("the cluster state is empty, so the reflector hasn't started or there are no pods for the application you've selected");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+            // TODO if redis isn't running, this just... blocks forever. I set a timeout on bb8 but
+            // it does nothing.
             let sidekiq_state = self.sidekiq_fetcher.get_current_state().await?;
             debug!("sleeping");
 
